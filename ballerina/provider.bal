@@ -126,8 +126,48 @@ public isolated client class ModelProvider {
         'class: "io.ballerina.lib.ai.ollama.Generator"
     } external;
 
+    # Sends a streaming chat request to the Ollama model with the given messages and tools.
+    #
+    # + messages - List of chat messages or user message
+    # + tools - Tool definitions to be used for the tool call
+    # + stop - Stop sequence to stop the completion
+    # + return - A stream of chat completion chunks, or an error in-case of failures
+    remote function chatStream(ai:ChatMessage[]|ai:ChatUserMessage messages,
+            ai:ChatCompletionFunctions[] tools = [], string? stop = ())
+            returns stream<ai:ChatCompletionChunk, ai:Error?>|ai:Error {
+        // Ollama streams newline-delimited JSON rather than Server-Sent Events, so
+        // the raw response is consumed as a byte stream and split into lines.
+        json payload = check self.prepareRequestPayload(messages, tools, stop, true);
+        http:Response|error response = self.ollamaClient->post("/api/chat", payload);
+        if response is error {
+            return error ai:LlmConnectionError("Error while connecting to ollama for streaming", response);
+        }
+        if response.statusCode != http:STATUS_OK {
+            string|error body = response.getTextPayload();
+            return error ai:LlmConnectionError(string `Ollama returned a non-OK status ` +
+                    string `${response.statusCode} for the streaming request: ${body is string ? body : ""}`);
+        }
+        stream<byte[], error?>|error byteStream = response.getByteStream();
+        if byteStream is error {
+            return error ai:Error("Failed to open the response stream from the model", byteStream);
+        }
+        stream<ai:ChatCompletionChunk, ai:Error?> chunkStream = new (new OllamaChunkIterator(byteStream));
+        return chunkStream;
+    }
+
+    # Sends a streaming chat request to the model using the given prompt and streams
+    # back the generated answer. Only `string` is supported as the expected type.
+    #
+    # + prompt - The prompt to use in the chat request
+    # + td - The expected type of the streamed value; must be `string`
+    # + return - A stream of the generated value, or an error if the type is unsupported
+    remote function generateStream(ai:Prompt prompt, @display {label: "Expected type"} typedesc<anydata> td = <>)
+            returns stream<td, ai:Error?>|ai:Error = @java:Method {
+        'class: "io.ballerina.lib.ai.ollama.StreamGenerator"
+    } external;
+
     private isolated function prepareRequestPayload(ai:ChatMessage[]|ai:ChatUserMessage messages,
-            ai:ChatCompletionFunctions[] tools, string? stop) returns json|ai:Error {
+            ai:ChatCompletionFunctions[] tools, string? stop, boolean 'stream = false) returns json|ai:Error {
         map<json> options = {...self.modleParameters};
         if stop is string {
             options["stop"] = [stop];
@@ -136,7 +176,7 @@ public isolated client class ModelProvider {
         map<json> payload = {
             model: self.modelType,
             messages: check self.mapToOllamaRequestMessage(messages),
-            'stream: false,
+            'stream,
             options
         };
         if tools.length() > 0 {
@@ -257,4 +297,183 @@ isolated function convertMessageToJson(ai:ChatMessage[]|ai:ChatMessage messages)
     }
     return messages !is ai:ChatUserMessage|ai:ChatSystemMessage ? messages :
         {role: messages.role, content: check getChatMessageStringContent(messages.content), name: messages.name};
+}
+
+# The line-feed byte that delimits the JSON objects of an Ollama stream.
+final byte NEWLINE = 10;
+
+# Iterator that converts Ollama's newline-delimited JSON stream into a stream of
+# normalized `ai:ChatCompletionChunk` values.
+#
+# Unlike the Server-Sent Event streams of OpenAI-compatible APIs, Ollama writes
+# one bare JSON object per line with no framing and no end sentinel; the terminal
+# chunk is the one with `done` set to true. Lines are assembled at the byte level
+# so that a multi-byte character split across two network reads is not corrupted.
+#
+# Ollama emits each tool call fully formed and without an index, so this iterator
+# keeps a running index across the whole stream and hands it to `toAiChunk`,
+# giving consumers the same index-keyed accumulation model as providers that
+# stream tool-call arguments in fragments.
+class OllamaChunkIterator {
+    private stream<byte[], error?> byteStream;
+    private byte[] buffer = [];
+    private boolean byteStreamDrained = false;
+    private boolean streamComplete = false;
+    private int nextToolCallIndex = 0;
+    private boolean sawToolCalls = false;
+
+    isolated function init(stream<byte[], error?> byteStream) {
+        self.byteStream = byteStream;
+    }
+
+    public isolated function next() returns record {|ai:ChatCompletionChunk value;|}|ai:Error? {
+        if self.streamComplete {
+            return ();
+        }
+        while true {
+            string? line = check self.nextLine();
+            if line is () {
+                return ();
+            }
+            string trimmedLine = line.trim();
+            if trimmedLine == "" {
+                continue;
+            }
+            json|error payload = trimmedLine.fromJsonString();
+            if payload is error {
+                return error ai:Error("Error while parsing a chunk of the model stream", payload);
+            }
+            // Ollama reports mid-stream failures as a bare `{"error": "..."}` object.
+            if payload is map<json> {
+                json errorMessage = payload["error"];
+                if errorMessage is string {
+                    return error ai:LlmError(string `Ollama reported an error while streaming: ${errorMessage}`);
+                }
+            }
+            OllamaChatStreamResponse|error chunk = payload.cloneWithType();
+            if chunk is error {
+                return error ai:Error("Error while binding a chunk of the model stream", chunk);
+            }
+
+            int toolCallIndexOffset = self.nextToolCallIndex;
+            OllamaToolCall[]? toolCalls = chunk.message?.tool_calls;
+            if toolCalls is OllamaToolCall[] && toolCalls.length() > 0 {
+                self.nextToolCallIndex += toolCalls.length();
+                self.sawToolCalls = true;
+            }
+            if chunk.done {
+                self.streamComplete = true;
+            }
+            return {value: toAiChunk(chunk, toolCallIndexOffset, self.sawToolCalls)};
+        }
+    }
+
+    public isolated function close() returns ai:Error? {
+        error? result = self.byteStream.close();
+        if result is error {
+            return error ai:Error("Error while closing the model stream", result);
+        }
+        return ();
+    }
+
+    # Pulls the next newline-delimited line out of the byte stream, buffering
+    # partial reads until a delimiter arrives. The trailing bytes left when the
+    # byte stream ends without a final newline are returned as the last line.
+    #
+    # + return - The next line, `()` once the byte stream is exhausted, or an error
+    private isolated function nextLine() returns string?|ai:Error {
+        while true {
+            int? newlineIndex = self.buffer.indexOf(NEWLINE);
+            if newlineIndex is int {
+                byte[] lineBytes = self.buffer.slice(0, newlineIndex);
+                self.buffer = self.buffer.slice(newlineIndex + 1);
+                return decodeLine(lineBytes);
+            }
+            if self.byteStreamDrained {
+                if self.buffer.length() == 0 {
+                    return ();
+                }
+                byte[] lineBytes = self.buffer;
+                self.buffer = [];
+                return decodeLine(lineBytes);
+            }
+            record {|byte[] value;|}|error? next = self.byteStream.next();
+            if next is error {
+                return error ai:Error("Error while reading the model stream", next);
+            }
+            if next is () {
+                self.byteStreamDrained = true;
+                continue;
+            }
+            self.buffer.push(...next.value);
+        }
+    }
+}
+
+# Decodes the bytes of one stream line as UTF-8.
+#
+# + lineBytes - The bytes of a single line, excluding the delimiter
+# + return - The decoded line, or an error if the bytes are not valid UTF-8
+isolated function decodeLine(byte[] lineBytes) returns string|ai:Error {
+    string|error line = string:fromBytes(lineBytes);
+    if line is error {
+        return error ai:Error("Error while decoding a chunk of the model stream", line);
+    }
+    return line;
+}
+
+# Builds the string stream returned by `ModelProvider.generateStream`. The native
+# `StreamGenerator` shim trampolines here so the type gating stays in Ballerina.
+# Only `string` is supported; other types yield an error because a partial
+# generation is a valid value only for `string`. When valid, the underlying
+# `chatStream` chunks are projected onto their text fragments.
+#
+# + llmModel - The model provider whose `chatStream` supplies the chunks
+# + prompt - The prompt to send to the model
+# + td - The caller's expected type; must be `string`
+# + return - A stream of text fragments, or an error if the type is unsupported
+function generateLlmResponseStream(ModelProvider llmModel, ai:Prompt prompt, typedesc<anydata> td)
+        returns stream<string, ai:Error?>|ai:Error {
+    if td !is typedesc<string> {
+        return error ai:Error("This data type is not supported for streaming. " +
+            "'generateStream' supports only 'string'; use 'generate' for structured types.");
+    }
+    stream<ai:ChatCompletionChunk, ai:Error?> chunks = check llmModel->chatStream({role: ai:USER, content: prompt});
+    stream<string, ai:Error?> textStream = new (new ChunkTextIterator(chunks));
+    return textStream;
+}
+
+# Projects a normalized `ai:ChatCompletionChunk` stream onto its text content,
+# yielding each non-empty `delta.content` fragment and skipping reasoning,
+# tool-call, and usage-only chunks. Backs `generateLlmResponseStream`.
+class ChunkTextIterator {
+    private stream<ai:ChatCompletionChunk, ai:Error?> chunks;
+
+    isolated function init(stream<ai:ChatCompletionChunk, ai:Error?> chunks) {
+        self.chunks = chunks;
+    }
+
+    public isolated function next() returns record {|string value;|}|ai:Error? {
+        while true {
+            record {|ai:ChatCompletionChunk value;|}|ai:Error? next = self.chunks.next();
+            if next is () {
+                return ();
+            }
+            if next is ai:Error {
+                return next;
+            }
+            ai:ChatCompletionChunkChoice[] choices = next.value.choices;
+            if choices.length() == 0 {
+                continue;
+            }
+            string? content = choices[0].delta.content;
+            if content is string && content.length() > 0 {
+                return {value: content};
+            }
+        }
+    }
+
+    public isolated function close() returns ai:Error? {
+        return self.chunks.close();
+    }
 }
