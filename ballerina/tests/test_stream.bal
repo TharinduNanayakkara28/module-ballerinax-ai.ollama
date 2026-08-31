@@ -79,6 +79,67 @@ final string TOOL_CALL_NDJSON = toNdjson([
     }
 ]);
 
+// A turn that ends in tool calls but is cut off by the token limit. Ollama would
+// report "length" here, and that must survive the tool-call correction.
+final string TOOL_CALL_CUT_OFF_NDJSON = toNdjson([
+    {
+        model: "llama2",
+        created_at: CREATED_AT,
+        message: {
+            role: "assistant",
+            content: "",
+            tool_calls: [{'function: {name: "getWeather", arguments: {city: "Colombo"}}}]
+        },
+        done: false
+    },
+    {
+        model: "llama2",
+        created_at: CREATED_AT,
+        message: {role: "assistant", content: ""},
+        done: true,
+        done_reason: "length"
+    }
+]);
+
+final string LENGTH_NDJSON = toNdjson([
+    {model: "llama2", created_at: CREATED_AT, message: {role: "assistant", content: "Hel"}, done: false},
+    {
+        model: "llama2",
+        created_at: CREATED_AT,
+        message: {role: "assistant", content: ""},
+        done: true,
+        done_reason: "length"
+    }
+]);
+
+// Ollama also reports lifecycle reasons such as "load" and "unload", which have
+// no counterpart in the `ai` enum.
+final string UNKNOWN_DONE_REASON_NDJSON = toNdjson([
+    {model: "llama2", created_at: CREATED_AT, message: {role: "assistant", content: "Hi"}, done: false},
+    {
+        model: "llama2",
+        created_at: CREATED_AT,
+        message: {role: "assistant", content: ""},
+        done: true,
+        done_reason: "load"
+    }
+]);
+
+// Ollama reports a mid-stream failure as a bare `{"error": "..."}` object.
+final string MID_STREAM_ERROR_NDJSON =
+    toNdjson([{model: "llama2", created_at: CREATED_AT, message: {role: "assistant", content: "Hi"}, done: false}]) +
+    "{\"error\":\"an unexpected error occurred\"}\n";
+
+final string MALFORMED_NDJSON =
+    toNdjson([{model: "llama2", created_at: CREATED_AT, message: {role: "assistant", content: "Hi"}, done: false}]) +
+    "{not json}\n";
+
+// Ends without a `done` chunk, as a connection cut mid-generation would.
+final string TRUNCATED_NDJSON = toNdjson([
+    {model: "llama2", created_at: CREATED_AT, message: {role: "assistant", content: "Par"}, done: false},
+    {model: "llama2", created_at: CREATED_AT, message: {role: "assistant", content: "tial"}, done: false}
+]);
+
 isolated function toNdjson(json[] chunks) returns string {
     string[] lines = from json chunk in chunks
         select chunk.toJsonString();
@@ -178,4 +239,176 @@ function testGenerateStreamWithUnsupportedType() {
     }
     test:assertEquals(result.message(), "This data type is not supported for streaming. " +
             "'generateStream' supports only 'string'; use 'generate' for structured types.");
+}
+
+// Guards the mapping bug where a single `ai:ChatUserMessage` — the shape
+// `generateStream` builds internally — went onto the wire with role "tool".
+@test:Config
+function testStreamingSendsUserRoleOnTheWire() returns error? {
+    stream<ai:ChatCompletionChunk, ai:Error?> chunkStream =
+        check ollamaStreamProvider->chatStream({role: ai:USER, content: "Say hello"});
+    _ = check collectChunks(chunkStream);
+    json[] sent = getLastStreamRequestMessages();
+    test:assertEquals(sent.length(), 1);
+    test:assertEquals(check sent[0].role, "user");
+    test:assertEquals(check sent[0].content, "Say hello");
+
+    stream<string, ai:Error?> textStream = check ollamaStreamProvider->generateStream(`Say hello`);
+    _ = check collectText(textStream);
+    json[] generated = getLastStreamRequestMessages();
+    test:assertEquals(generated.length(), 1);
+    test:assertEquals(check generated[0].role, "user");
+}
+
+// The normalized type carries the role on the first delta only, even though
+// Ollama stamps it on every chunk.
+@test:Config
+function testChatStreamEmitsRoleOnlyOnFirstDelta() returns error? {
+    stream<ai:ChatCompletionChunk, ai:Error?> chunkStream = check ollamaStreamProvider->chatStream(
+        [{role: ai:USER, content: "Say hello"}]);
+    ai:ChatCompletionChunk[] chunks = check collectChunks(chunkStream);
+
+    test:assertEquals(chunks[0].choices[0].delta.role, ai:ASSISTANT);
+    foreach int i in 1 ..< chunks.length() {
+        test:assertEquals(chunks[i].choices[0].delta.role, (),
+                string `Chunk ${i} must not repeat the role`);
+    }
+}
+
+// `content` is `()` for a delta that carries no answer text; Ollama sends an
+// empty string on the tool-call and terminal chunks instead.
+@test:Config
+function testChatStreamContentIsNilForNonContentDeltas() returns error? {
+    stream<ai:ChatCompletionChunk, ai:Error?> chunkStream = check ollamaStreamProvider->chatStream(
+        [{role: ai:USER, content: string `What is the ${WEATHER_PROMPT}?`}]);
+    ai:ChatCompletionChunk[] chunks = check collectChunks(chunkStream);
+
+    foreach ai:ChatCompletionChunk chunk in chunks {
+        test:assertEquals(chunk.choices[0].delta.content, ());
+    }
+}
+
+// A tool-calling turn that really ran into the token limit must keep `length`;
+// reporting `tool_calls` there would hide the truncation.
+@test:Config
+function testChatStreamToolCallsCutOffByLength() returns error? {
+    stream<ai:ChatCompletionChunk, ai:Error?> chunkStream = check ollamaStreamProvider->chatStream(
+        [{role: ai:USER, content: SCENARIO_TOOL_CALL_CUT_OFF}]);
+    ai:ChatCompletionChunk[] chunks = check collectChunks(chunkStream);
+
+    test:assertEquals(chunks.length(), 2);
+    ai:ToolCallChunk[] toolCalls = check chunks[0].choices[0].delta.toolCalls.ensureType();
+    test:assertEquals(toolCalls.length(), 1);
+    test:assertEquals(chunks[1].choices[0].finishReason, ai:LENGTH);
+}
+
+@test:Config
+function testChatStreamLengthFinishReason() returns error? {
+    stream<ai:ChatCompletionChunk, ai:Error?> chunkStream = check ollamaStreamProvider->chatStream(
+        [{role: ai:USER, content: SCENARIO_LENGTH}]);
+    ai:ChatCompletionChunk[] chunks = check collectChunks(chunkStream);
+    test:assertEquals(chunks[chunks.length() - 1].choices[0].finishReason, ai:LENGTH);
+}
+
+// Ollama's lifecycle reasons ("load", "unload") have no `ai:FinishReason`
+// counterpart and must map to `()` rather than failing the stream.
+@test:Config
+function testChatStreamUnknownDoneReason() returns error? {
+    stream<ai:ChatCompletionChunk, ai:Error?> chunkStream = check ollamaStreamProvider->chatStream(
+        [{role: ai:USER, content: SCENARIO_UNKNOWN_DONE_REASON}]);
+    ai:ChatCompletionChunk[] chunks = check collectChunks(chunkStream);
+    test:assertEquals(chunks[chunks.length() - 1].choices[0].finishReason, ());
+}
+
+@test:Config
+function testChatStreamNonOkStatus() {
+    stream<ai:ChatCompletionChunk, ai:Error?>|ai:Error result = ollamaStreamProvider->chatStream(
+        [{role: ai:USER, content: SCENARIO_SERVER_ERROR}]);
+    if result !is ai:Error {
+        test:assertFail("Expected an error for a non-OK status");
+    }
+    test:assertTrue(result is ai:LlmConnectionError, "Expected an ai:LlmConnectionError");
+    test:assertTrue(result.message().includes("non-OK status 500"), result.message());
+    // The response body is surfaced so the caller can see why the model refused.
+    test:assertTrue(result.message().includes("not found"), result.message());
+}
+
+@test:Config
+function testChatStreamMidStreamError() returns error? {
+    stream<ai:ChatCompletionChunk, ai:Error?> chunkStream = check ollamaStreamProvider->chatStream(
+        [{role: ai:USER, content: SCENARIO_MID_STREAM_ERROR}]);
+    ai:ChatCompletionChunk[]|ai:Error chunks = collectChunks(chunkStream);
+    if chunks !is ai:Error {
+        test:assertFail("Expected the mid-stream error object to fail the stream");
+    }
+    test:assertTrue(chunks.message().includes("an unexpected error occurred"), chunks.message());
+    // A failed stream is terminal: it must not re-enter the read loop.
+    test:assertEquals(chunkStream.next(), ());
+}
+
+@test:Config
+function testChatStreamMalformedChunk() returns error? {
+    stream<ai:ChatCompletionChunk, ai:Error?> chunkStream = check ollamaStreamProvider->chatStream(
+        [{role: ai:USER, content: SCENARIO_MALFORMED}]);
+    ai:ChatCompletionChunk[]|ai:Error chunks = collectChunks(chunkStream);
+    if chunks !is ai:Error {
+        test:assertFail("Expected a malformed chunk to fail the stream");
+    }
+    test:assertTrue(chunks is ai:LlmInvalidResponseError, "Expected an ai:LlmInvalidResponseError");
+    test:assertEquals(chunkStream.next(), ());
+}
+
+// A stream that ends without a `done` chunk was cut short; reporting normal
+// completion would pass a partial answer off as a whole one.
+@test:Config
+function testChatStreamTruncatedStreamFails() returns error? {
+    stream<ai:ChatCompletionChunk, ai:Error?> chunkStream = check ollamaStreamProvider->chatStream(
+        [{role: ai:USER, content: SCENARIO_TRUNCATED}]);
+    ai:ChatCompletionChunk[]|ai:Error chunks = collectChunks(chunkStream);
+    if chunks !is ai:Error {
+        test:assertFail("Expected a truncated stream to fail");
+    }
+    test:assertTrue(chunks is ai:LlmInvalidResponseError, "Expected an ai:LlmInvalidResponseError");
+    test:assertTrue(chunks.message().includes("ended before the final chunk"), chunks.message());
+}
+
+// `generateStream` surfaces the same truncation, rather than returning a short
+// answer as if it were complete.
+@test:Config
+function testGenerateStreamTruncatedStreamFails() returns error? {
+    stream<string, ai:Error?> textStream =
+        check ollamaStreamProvider->generateStream(`${SCENARIO_TRUNCATED}`);
+    string|ai:Error text = collectText(textStream);
+    if text !is ai:Error {
+        test:assertFail("Expected a truncated stream to fail");
+    }
+    test:assertTrue(text.message().includes("ended before the final chunk"), text.message());
+}
+
+// Abandoning a stream part way must release it, and closing twice must be a
+// no-op rather than an error.
+@test:Config
+function testChatStreamCloseIsIdempotent() returns error? {
+    stream<ai:ChatCompletionChunk, ai:Error?> chunkStream = check ollamaStreamProvider->chatStream(
+        [{role: ai:USER, content: "Say hello"}]);
+    record {|ai:ChatCompletionChunk value;|}|ai:Error? first = chunkStream.next();
+    if first is ai:Error? {
+        test:assertFail("Expected at least one chunk");
+    }
+    check chunkStream.close();
+    check chunkStream.close();
+    test:assertEquals(chunkStream.next(), ());
+}
+
+isolated function collectText(stream<string, ai:Error?> textStream) returns string|ai:Error {
+    string content = "";
+    record {|string value;|}|ai:Error? next = textStream.next();
+    while next !is ai:Error? {
+        content += next.value;
+        next = textStream.next();
+    }
+    if next is ai:Error {
+        return next;
+    }
+    return content;
 }

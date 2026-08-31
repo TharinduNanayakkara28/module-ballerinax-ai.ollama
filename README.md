@@ -8,6 +8,44 @@
 
 This module provides a generic API for connecting with Ollama LLM chat completion models.
 
+### Streaming
+
+Alongside `chat` and `generate`, the provider supports streaming responses:
+
+- `chatStream` returns a `stream<ai:ChatCompletionChunk, ai:Error?>`, normalizing Ollama's
+  newline-delimited JSON onto the same chunk shape every `ballerina/ai` provider uses.
+- `generateStream` streams the generated answer as text fragments. Only `string` is
+  supported as the expected type — a partial generation is a valid value only for
+  `string`; use `generate` for structured types.
+
+```ballerina
+import ballerina/ai;
+import ballerina/io;
+import ballerinax/ai.ollama;
+
+public function main() returns error? {
+    ai:ModelProvider model = check new ollama:ModelProvider("llama3.2");
+
+    stream<string, ai:Error?> answer = check model->generateStream(`Explain streaming in one paragraph.`);
+    check from string fragment in answer
+        do {
+            io:print(fragment);
+        };
+}
+```
+
+A `foreach`/`from` over the stream closes it once iteration finishes. When driving the
+stream by hand with `next()`, call `close()` if you stop early, so the underlying
+connection is released.
+
+Because a streamed generation holds the connection open for as long as the model keeps
+producing tokens, a long generation can outlive the HTTP client's default timeout. Raise
+it through the connection configuration when generating long answers:
+
+```ballerina
+ai:ModelProvider model = check new ollama:ModelProvider("llama3.2", timeout = 300);
+```
+
 ## Issues and projects
 
 Issues and Projects tabs are disabled for this repository as this is part of the Ballerina Library. To report bugs, request new features, start new discussions, view project boards, etc., go to the [Ballerina Library parent repository](https://github.com/ballerina-platform/ballerina-standard-library).

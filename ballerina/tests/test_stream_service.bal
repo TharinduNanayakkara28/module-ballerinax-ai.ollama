@@ -18,6 +18,31 @@ import ballerina/http;
 import ballerina/io;
 import ballerina/test;
 
+// Markers a test puts in the prompt to pick which response the mock plays back.
+const SCENARIO_TOOL_CALL_CUT_OFF = "scenario:tool-call-cut-off";
+const SCENARIO_LENGTH = "scenario:length";
+const SCENARIO_UNKNOWN_DONE_REASON = "scenario:unknown-done-reason";
+const SCENARIO_SERVER_ERROR = "scenario:server-error";
+const SCENARIO_MID_STREAM_ERROR = "scenario:mid-stream-error";
+const SCENARIO_MALFORMED = "scenario:malformed";
+const SCENARIO_TRUNCATED = "scenario:truncated";
+
+// The messages of the most recent request, so tests can assert on what actually
+// went onto the wire rather than only on what came back.
+isolated json[] lastStreamRequestMessages = [];
+
+isolated function recordStreamRequestMessages(json[] messages) {
+    lock {
+        lastStreamRequestMessages = messages.clone();
+    }
+}
+
+isolated function getLastStreamRequestMessages() returns json[] {
+    lock {
+        return lastStreamRequestMessages.clone();
+    }
+}
+
 // A mock of Ollama's /api/chat endpoint in streaming mode. Ollama replies with
 // newline-delimited JSON, one object per line, terminated by an object with
 // `done` set to true.
@@ -25,8 +50,17 @@ service /streaming on new http:Listener(8081) {
     resource function post api/chat(map<json> payload) returns http:Response|error {
         test:assertEquals(payload.'stream, true, "Streaming requests must set 'stream' to true");
         json[] messages = check payload.messages.ensureType();
+        recordStreamRequestMessages(messages);
         string content = check messages[messages.length() - 1].content.ensureType();
-        string ndjson = content.includes(WEATHER_PROMPT) ? TOOL_CALL_NDJSON : TEXT_NDJSON;
+
+        if content.includes(SCENARIO_SERVER_ERROR) {
+            http:Response errorResponse = new;
+            errorResponse.statusCode = http:STATUS_INTERNAL_SERVER_ERROR;
+            errorResponse.setTextPayload("model \"llama2\" not found");
+            return errorResponse;
+        }
+
+        string ndjson = selectNdjson(content);
         // Deliberately split the payload at boundaries that fall inside JSON
         // objects and inside multi-byte characters, so that the client's line
         // buffering is exercised rather than handed one line per read.
@@ -35,6 +69,31 @@ service /streaming on new http:Listener(8081) {
         response.setByteStream(byteStream, "application/x-ndjson");
         return response;
     }
+}
+
+isolated function selectNdjson(string content) returns string {
+    if content.includes(SCENARIO_TOOL_CALL_CUT_OFF) {
+        return TOOL_CALL_CUT_OFF_NDJSON;
+    }
+    if content.includes(SCENARIO_LENGTH) {
+        return LENGTH_NDJSON;
+    }
+    if content.includes(SCENARIO_UNKNOWN_DONE_REASON) {
+        return UNKNOWN_DONE_REASON_NDJSON;
+    }
+    if content.includes(SCENARIO_MID_STREAM_ERROR) {
+        return MID_STREAM_ERROR_NDJSON;
+    }
+    if content.includes(SCENARIO_MALFORMED) {
+        return MALFORMED_NDJSON;
+    }
+    if content.includes(SCENARIO_TRUNCATED) {
+        return TRUNCATED_NDJSON;
+    }
+    if content.includes(WEATHER_PROMPT) {
+        return TOOL_CALL_NDJSON;
+    }
+    return TEXT_NDJSON;
 }
 
 # Emits a byte array in fixed-size slices, regardless of where the line and
